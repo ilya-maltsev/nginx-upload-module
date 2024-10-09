@@ -982,6 +982,7 @@ ngx_http_upload_handler(ngx_http_request_t *r)
     }
 	
     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+	upload_shutdown_ctx(u);
         return rc;
     }
 
@@ -3586,7 +3587,7 @@ ngx_http_read_upload_client_request_body(ngx_http_request_t *r) {
             }
         }
     } else{
-        upload_shutdown_ctx(u);
+        //upload_shutdown_ctx(u);
         return NGX_HTTP_BAD_REQUEST;
     }
 
