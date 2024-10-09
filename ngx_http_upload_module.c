@@ -197,6 +197,7 @@ typedef struct {
     ngx_flag_t                    tame_arrays;
     ngx_flag_t                    resumable_uploads;
     ngx_flag_t                    calculate_gost_hash;
+    ngx_flag_t                    empty_file_content;
     ngx_flag_t                    empty_field_names;
     size_t                        limit_rate;
 
@@ -683,8 +684,18 @@ static ngx_command_t  ngx_http_upload_commands[] = { /* {{{ */
        ngx_conf_set_flag_slot,
        NGX_HTTP_LOC_CONF_OFFSET,
        offsetof(ngx_http_upload_loc_conf_t, calculate_gost_hash),
-       NULL }, 
-	
+       NULL },
+
+     /*
+      * Specifies whether empty file uploads are allowed
+      */
+     { ngx_string("empty_file_content"),
+       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_HTTP_LIF_CONF
+                         |NGX_CONF_FLAG,
+       ngx_conf_set_flag_slot,
+       NGX_HTTP_LOC_CONF_OFFSET,
+       offsetof(ngx_http_upload_loc_conf_t, empty_file_content),
+       NULL },	
 	
      /*
       * Specifies whether empty field names are allowed
@@ -948,6 +959,11 @@ ngx_http_upload_handler(ngx_http_request_t *r)
         r->request_body_no_buffering = 1;
 
         rc = ngx_http_read_client_request_body(r, ngx_http_upload_read_event_handler);
+	    
+        if (rc == NGX_HTTP_NO_CONTENT) {
+            upload_shutdown_ctx(u);
+            ngx_http_finalize_request(r, rc);
+        }
 
         if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
             upload_shutdown_ctx(u);
@@ -960,6 +976,11 @@ ngx_http_upload_handler(ngx_http_request_t *r)
 
     rc = ngx_http_read_upload_client_request_body(r);
 
+    if (rc == NGX_HTTP_NO_CONTENT) {
+        upload_shutdown_ctx(u);
+        ngx_http_finalize_request(r, rc);
+    }
+	
     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
         return rc;
     }
@@ -2582,6 +2603,7 @@ ngx_http_upload_create_loc_conf(ngx_conf_t *cf)
     conf->tame_arrays = NGX_CONF_UNSET;
     conf->resumable_uploads = NGX_CONF_UNSET;
     conf->calculate_gost_hash = NGX_CONF_UNSET;
+    conf->empty_file_content = NGX_CONF_UNSET;
     conf->empty_field_names = NGX_CONF_UNSET;
 
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
@@ -2674,6 +2696,11 @@ ngx_http_upload_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->calculate_gost_hash = (prev->calculate_gost_hash != NGX_CONF_UNSET) ?
             prev->calculate_gost_hash : 0;
     }    
+
+    if(conf->empty_file_content == NGX_CONF_UNSET) {
+        conf->empty_file_content = (prev->empty_file_content != NGX_CONF_UNSET) ?
+            prev->empty_file_content : 0;
+    }
 
     if(conf->empty_field_names == NGX_CONF_UNSET) {
         conf->empty_field_names = (prev->empty_field_names != NGX_CONF_UNSET) ?
@@ -3479,6 +3506,16 @@ ngx_http_read_upload_client_request_body(ngx_http_request_t *r) {
     ngx_http_core_loc_conf_t  *clcf;
     ngx_http_upload_ctx_t     *u = ngx_http_get_module_ctx(r, ngx_http_upload_module);
 
+    //empty file support
+    ngx_http_upload_loc_conf_t  *ulcf = ngx_http_get_module_loc_conf(r, ngx_http_upload_module);
+    ngx_file_t  *e_file = &u->output_file;
+    ngx_path_t  *e_file_path = u->store_path;
+    ngx_table_elt_t          *filename;
+    ngx_int_t                 rc;
+    ngx_str_t   c_path;
+    ngx_err_t   err;
+    //empty file support
+
 #if defined nginx_version && nginx_version >= 8011
     r->main->count++;
 #endif
@@ -3496,6 +3533,59 @@ ngx_http_read_upload_client_request_body(ngx_http_request_t *r) {
     r->request_body = rb;
 
     if (r->headers_in.content_length_n <= 0) {
+        if(ulcf->empty_file_content) {
+  
+            filename = search_headers_in(r,(u_char *) "X-Session-ID", sizeof("X-Session-ID") - 1);
+            if (filename == NULL) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                       "\"X-Session-ID\" header is NULL");
+                return NGX_HTTP_BAD_REQUEST;
+            } else if(ngx_http_upload_validate_session_id(&filename->value) != NGX_OK)
+            {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                       "Filename header is malformed - \"%s\"", filename->value.data);
+                return NGX_HTTP_BAD_REQUEST;
+            }
+        
+            rc = ngx_http_upload_eval_path(r);
+            if(rc != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                              "rc is not OK");
+                upload_shutdown_ctx(u);
+                return rc;
+            }
+      
+            c_path.len = e_file_path->name.len + filename->value.len;
+            c_path.data = ngx_pcalloc(r->pool, c_path.len + 2);
+     
+            if(c_path.data == NULL)
+                return NGX_UPLOAD_NOMEM;     
+     
+            ngx_memcpy(c_path.data, e_file_path->name.data, e_file_path->name.len);
+            ngx_memcpy(c_path.data + e_file_path->name.len, (u_char *) "/", 1); 
+            ngx_memcpy(c_path.data + e_file_path->name.len + 1, filename->value.data, filename->value.len);
+
+            if (ngx_create_dir(e_file_path->name.data, 0700) == NGX_FILE_ERROR) {
+                err = ngx_errno;
+                if (err != NGX_EEXIST) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                              "failed to create upload directory \"%s\"", e_file_path->name.data);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+	    }
+
+            e_file->fd = ngx_open_file(c_path.data, NGX_FILE_WRONLY, NGX_FILE_CREATE_OR_OPEN, ulcf->store_access);
+
+            if (e_file->fd == NGX_INVALID_FILE) {
+                ngx_log_error(NGX_LOG_ERR, u->log, ngx_errno,
+                      "failed to create file \"%V\"", c_path.data);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }else {
+                ngx_close_file(e_file->fd);
+                return NGX_HTTP_NO_CONTENT;
+            }
+        }
+    } else{
         upload_shutdown_ctx(u);
         return NGX_HTTP_BAD_REQUEST;
     }
